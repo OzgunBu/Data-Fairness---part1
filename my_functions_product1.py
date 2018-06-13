@@ -7,6 +7,22 @@ Created on Mon Jun 11 15:15:42 2018
 """
 import pandas as pd
 import numpy as np
+
+
+import keras as ke
+import keras.backend as K
+from keras.layers import Input, Dense, Dropout
+from keras.models import Model
+from keras.models import load_model
+# model reconstruction from JSON:
+from keras.models import model_from_json
+
+
+import sklearn as sk
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, roc_auc_score
+from sklearn.utils.class_weight import compute_class_weight
 #==============================================================================
 def Input_file_checking(filename):
     """ 
@@ -275,6 +291,10 @@ def read_process_data_output_bias(filename_str):
     print('sensitive field:{} Class 0-1 {}, {}'.format(sensitive_field,sensitive_class0,sensitive_class1 ))
     print('not to consider fields',not_to_consider_fields)
    
+    # let'see the filename
+    result_fname = result_filename(filename_str,cprediction_field_exists,cprediction_field,target_field, sensitive_field, not_to_consider_fields,sensitive_class0,sensitive_class1,target_label0,target_label1 )
+    print('result file: ', result_fname )
+    
     ### First let's see how biased your data:
    
     Ybin, Zbin = enforcing_binary_output_sensitive(Y_df,target_field,target_label0, target_label1,Z_df,sensitive_field,sensitive_class0,sensitive_class1)
@@ -288,6 +308,174 @@ def read_process_data_output_bias(filename_str):
         p_rule_for_Y0,p_rule_for_Y1 = bias_checker_p_rule_bin(Zbin, Ybin)   
         print('Current prediction field: p_rule_for_Y1',p_rule_for_Y1)
         
-    return X_df, Ybin, Zbin     
+    return X_df, Ybin, Zbin, result_fname     
 
 #==============================================================================
+def result_filename(path,cprediction_field_exists,cprediction_field,target_field, sensitive_field, not_to_consider_fields,sensitive_class0,sensitive_class1,target_label0,target_label1 ):
+    result_fname = path + '_'
+    result_fname = result_fname + 'CP_' + cprediction_field_exists +'_'
+    if cprediction_field_exists == 'Y':
+        result_fname = result_fname + cprediction_field
+    
+    result_fname = result_fname + 'T_' + target_field +'_'+ target_label0 +'_'+ target_label1 +'_'
+    result_fname = result_fname + 'S_' + sensitive_field +'_'+ sensitive_class0 +'_'+ sensitive_class1 +'_'
+    
+    result_fname =  result_fname.replace(' ','_')
+    result_fname =  result_fname.replace('/' ,'--')
+    
+    return result_fname
+
+
+#==============================================================================
+#==============================================================================
+ # HIDE
+
+class FairClassifier(object):
+    
+    def __init__(self, tradeoff_lambda,main_task_arch_json_string,adv_task_arch_json_string,pre_load_flag=True,main_task_trained_weight_file=None):
+        self.tradeoff_lambda = tradeoff_lambda
+        
+        
+        
+        clf_net = self._create_clf_net(main_task_arch_json_string)
+        adv_net = self._create_adv_net(adv_task_arch_json_string)
+        
+        clf_inputs = clf_net.input
+        
+        #adv_inputs = adv_net.input
+    
+        
+        self._trainable_clf_net = self._make_trainable(clf_net)
+        self._trainable_adv_net = self._make_trainable(adv_net)
+        self._clf = self._compile_clf(clf_net)
+        
+        self._clf_w_adv = self._compile_clf_w_adv(clf_inputs, clf_net, adv_net)
+        self._adv = self._compile_adv(clf_inputs, clf_net, adv_net)
+        self._val_metrics = None
+        self._fairness_metrics = None
+        
+        self.predict = self._clf.predict
+        
+    def _make_trainable(self, net):
+        def make_trainable(flag):
+            net.trainable = flag
+            for layer in net.layers:
+                layer.trainable = flag
+        return make_trainable
+    
+    
+    def _create_clf_net(self, main_task_arch_json_string):
+        architecture = model_from_json(main_task_arch_json_string)
+        return(architecture)
+    
+    
+    def _create_adv_net(self, adv_task_arch_json_string):
+        architecture = model_from_json(adv_task_arch_json_string)
+        return(architecture)    
+    
+    def _compile_clf(self, clf_net):
+        clf = clf_net
+        self._trainable_clf_net(True)
+        clf.compile(loss='binary_crossentropy', optimizer='adam')
+        return clf
+        
+    def _compile_clf_w_adv(self, inputs, clf_net, adv_net):
+    
+        clf_w_adv = Model(inputs=[inputs], outputs=[clf_net(inputs)]+[adv_net(clf_net(inputs))])
+        
+        self._trainable_clf_net(True)
+        self._trainable_adv_net(False)
+        loss_weights = [1.]+[-self.tradeoff_lambda]
+        
+        clf_w_adv.compile(loss=['binary_crossentropy']*(len(loss_weights)), 
+                          loss_weights=loss_weights,
+                          optimizer='adam')
+        return clf_w_adv
+    
+    def _compile_adv(self, inputs, clf_net, adv_net):
+        adv = Model(inputs=[inputs], outputs=adv_net(clf_net(inputs)))
+        self._trainable_clf_net(False)
+        self._trainable_adv_net(True)
+        adv.compile(loss=['binary_crossentropy'], optimizer='adam')
+        return adv
+    
+    def _compute_class_weights(self, data_set):
+        class_values = [0, 1]
+        class_weights = []
+    
+        balanced_weights = compute_class_weight('balanced', class_values, data_set)
+        class_weights.append(dict(zip(class_values, balanced_weights)))
+    
+        return class_weights
+    
+    def _compute_target_class_weights(self, y):
+        class_values  = [0,1]
+        balanced_weights =  compute_class_weight('balanced', class_values, y)
+        class_weights = {'y': dict(zip(class_values, balanced_weights))}
+        
+        return class_weights
+        
+    def pretrain(self, x, y, z, epochs=10, verbose=0,pre_load_flag=True,main_task_trained_weight_file=None):
+        
+        if pre_load_flag == False:
+            self._trainable_clf_net(True)
+            self._clf.fit(x.values, y.values, epochs=epochs, verbose=verbose)
+            self._trainable_clf_net(False)
+            self._trainable_adv_net(True)
+            class_weight_adv = self._compute_class_weights(z)
+            self._adv.fit(x.values, z.values, class_weight=class_weight_adv, 
+                      epochs=epochs, verbose=verbose)
+        else:
+    
+            self._clf.load_weights(main_task_trained_weight_file)
+    
+    
+            
+            self._trainable_clf_net(False)
+            self._trainable_adv_net(True)
+            class_weight_adv = self._compute_class_weights(z)
+            self._adv.fit(x.values, z.values, class_weight=class_weight_adv, 
+                      epochs=epochs, verbose=verbose)
+            
+    def fit(self, x, y, z, validation_data=None, T_iter=250, batch_size=128,
+            save_figs=False):
+        
+        
+        if validation_data is not None:
+            x_val, y_val, z_val = validation_data
+    
+        class_weight_adv = self._compute_class_weights(z)
+        class_weight_clf_w_adv = [{0:1., 1:1.}]+class_weight_adv
+        
+        #self._val_metrics = pd.DataFrame()
+        #self._fairness_metrics = [] #pd.DataFrame()  
+        
+        for idx in range(T_iter):
+            #print(idx)
+            #if validation_data is not None:
+                #y_pred = pd.Series(self._clf.predict(x_val).ravel(), index=y_val.index)
+                #self._val_metrics.loc[idx, 'ROC AUC'] = roc_auc_score(y_val, y_pred)
+                #self._val_metrics.loc[idx, 'Accuracy'] = (accuracy_score(y_val, (y_pred>0.5))*100)
+                
+               
+                #self._fairness_metrics.append(myFC.bias_checker_p_rule_bin((y_pred>0.5)*1.0,z_val))
+                
+                #display.clear_output(wait=True)
+    
+            # train adverserial
+            self._trainable_clf_net(False)
+            self._trainable_adv_net(True)
+            self._adv.fit(x.values, z.values, batch_size=batch_size, 
+                          class_weight=class_weight_adv, epochs=1, verbose=0)
+            
+            # train classifier
+            self._trainable_clf_net(True)
+            self._trainable_adv_net(False)
+            indices = np.random.permutation(len(x))[:batch_size]
+            #self._clf_w_adv.train_on_batch(x.values[indices], 
+                                           #[y.values[indices]]+[z.values[indices]])
+            self._clf_w_adv.train_on_batch(x.values[indices], 
+                                           [y.values[indices]]+[z.values[indices]],
+                                           class_weight=class_weight_clf_w_adv)   
+
+
